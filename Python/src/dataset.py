@@ -39,7 +39,7 @@ class HierarchicalDataset:
         self,
         config_dir="../../data/catalog.yml",
         cases_dir="../../data/COVID-19-up-to-date.csv",
-        ifr_dir="../../data/weighted_fatality.csv",
+        ifr_dir="../../data/popt_ifr.csv",
         serial_interval_dir="../../data/serial_interval.csv",
         interventions_dir="../../data/interventions.csv",
         num_countries=11,
@@ -58,7 +58,7 @@ class HierarchicalDataset:
         self.countries = config["countries"]
         self.cases = pd.read_csv(cases_dir, encoding="ISO-8859-1")
         self.serial_interval = pd.read_csv(serial_interval_dir)
-        covariates = pd.read_csv(interventions_dir)
+        covariates = pd.read_csv("../../data/interventions.csv", parse_dates=['Date effective'])
         self.num_countries = num_countries
         self.num_covariates = num_covariates
         # whether to use smaller dataset for debugging
@@ -66,28 +66,38 @@ class HierarchicalDataset:
 
         # process the datasets
         # remaing column and the UK in particular
-        ifr = pd.read_csv(ifr_dir)
+        ifr = pd.read_csv(ifr_dir, index_col=0)
         # inefficient bit but couldn't figure out why .rename() doesn't work
-        ifr["country"] = ifr.iloc[:, 1]
+        ifr = ifr.rename(columns={'Country': "country"})
         # rename the UK
-        ifr["country"][ifr["country"] == "United Kingdom"] = "United_Kingdom"
+        ifr.loc[ifr["country"] == "United Kingdom", "country"] = "United_Kingdom"
         self.ifr = ifr
+        
         # pick out the covariates for the countries (11 by default, 8 interventions)
-        # num_covariates+1 because we need the Country index column too
-        covariates = covariates.iloc[:num_countries, : num_covariates + 1]
-        self.covariate_names = list(covariates.columns)[1:]
-        # convert the dates to datetime
-        for covariate_name in self.covariate_names:
-            covariates[covariate_name] = covariates[covariate_name].apply(
-                pd.to_datetime, format="%Y-%m-%d"
-            )
 
+        covariate_names = ['Schools + Universities','Self-isolating if ill', 'Public events', 
+                           'Lockdown', 'Social distancing encouraged']
+        new_covariate_names = ['schools_universities', 'self_isolating_if_ill',
+                               'public_events', 'lockdown', 
+                               'social_distancing_encouraged']
+        covariates = covariates.loc[covariates['Type'].isin(covariate_names)]
+
+        covariates = covariates.pivot(index="Country", columns="Type", values="Date effective")
+        covariates = covariates[covariate_names]
+
+        covariates = covariates.rename(
+            columns={o: n for o, n in zip(covariate_names, new_covariate_names)})
+        self.covariate_names = ['schools_universities', 'self_isolating_if_ill',
+                                 'public_events', 
+                                 'lockdown', 'social_distancing_encouraged']
+        covariates = covariates[self.covariate_names]
+        
         # making all covariates that happen after lockdown to have same date as lockdown
         non_lockdown_covariates = self.covariate_names.copy()
         non_lockdown_covariates.remove("lockdown")
         for covariate_name in non_lockdown_covariates:
             ind = covariates[covariate_name] > covariates["lockdown"]
-            covariates[covariate_name][ind] = covariates["lockdown"][ind]
+            covariates.loc[ind, covariate_name] = covariates.loc[ind, "lockdown"]
 
         self.covariates = covariates
 
@@ -115,10 +125,12 @@ class HierarchicalDataset:
 
         # TODO: we will use lists, but we need to be careful of stack memory in the future
         stan_data["EpidemicStart"] = []
+        stan_data["pop"] = []
         stan_data["y"] = []
         stan_data["N"] = []
         # initialise with number of covariates
-        for i in range(1, self.num_covariates+1):
+        # FIXME having to add another one
+        for i in range(1, self.num_covariates + 1):
             stan_data["covariate{}".format(i)] = np.zeros((N2, self.num_countries))
 
         # store the covariates in a numpy array, initialised
@@ -128,11 +140,10 @@ class HierarchicalDataset:
 
         # we will generate the dataset in this country order. Could also use a pandas dataframe, but not necessary in my opinion
         for country_num, country in enumerate(self.countries):
-            ifr = self.ifr["weighted_fatality"][self.ifr["country"] == country]
-            covariates1 = self.covariates.loc[
-                self.covariates["Country"] == country, self.covariate_names
-            ]
-            cases = self.cases[self.cases["countriesAndTerritories"] == country]
+            print('country:{}'.format(country))
+            ifr = self.ifr.loc[self.ifr["country"] == country, "ifr"]
+            covariates1 = self.covariates.loc[country, self.covariate_names]
+            cases = self.cases.loc[self.cases["countriesAndTerritories"] == country].copy()
             cases["date"] = cases["dateRep"].apply(pd.to_datetime, format="%d/%m/%Y")
 
             cases["t"] = cases["date"].apply(lambda v: dt_to_dec(v))
@@ -158,10 +169,12 @@ class HierarchicalDataset:
 
             # update Epidemic Start day for each country
             stan_data["EpidemicStart"].append(index_1 + 1 - index_2)
+            stan_data["pop"].append(self.ifr.loc[self.ifr["country"] == country, "popt"])
+            
             # turn intervention dates into boolean
             for covariate in self.covariate_names:
                 cases[covariate] = (
-                    cases["date"] > covariates1[covariate].values[0]
+                    cases["date"] > covariates1[covariate]
                 ) * 1
 
             # record dates for cases in the country
@@ -196,12 +209,12 @@ class HierarchicalDataset:
                 # infection to onset
                 mean_1 = 5.1
                 cv_1 = 0.86
-                loc_1 = 1 / cv_1 ** 2
+                loc_1 = 1. / cv_1 ** 2
                 scale_1 = mean_1 * cv_1 ** 2
                 # onset to death
                 mean_2 = 18.8
                 cv_2 = 0.45
-                loc_2 = 1 / cv_2 ** 2
+                loc_2 = 1. / cv_2 ** 2
                 scale_2 = mean_2 * cv_2 ** 2
                 # assume that IFR is probability of dying given infection
                 x1 = gamma_np(shape=loc_1, scale=scale_1, size=int(5e6))
@@ -211,10 +224,12 @@ class HierarchicalDataset:
                 # CDF of sum of 2 gamma distributions
                 gamma_cdf = ECDF(x1 + x2)
 
-                # probability distribution of the infection-to-death distribution \pi_m in the paper
+                # probability distribution of the infection-to-death distribution \pi_m
+                # in the paper
                 def convolution(u):
                     return ifr * gamma_cdf(u)
 
+                print(convolution(1.5) - convolution(0))
                 h[0] = convolution(1.5) - convolution(0)
 
                 for i in range(1, len(h)):
@@ -234,16 +249,28 @@ class HierarchicalDataset:
             stan_data["y"].append(cases["cases"].values[0])
             stan_data["deaths"][:N, country_num] = cases["deaths"]
             stan_data["cases"][:N, country_num] = cases["cases"]
-            covariates2 = np.zeros((N2, self.num_covariates))
+            covariates2 = np.zeros((N2, len(self.covariate_names)))
             covariates2[:N, :] = cases[self.covariate_names].values
             covariates2[N:N2, :] = covariates2[N - 1, :]
             covariates2 = pd.DataFrame(covariates2, columns=self.covariate_names)
 
-            for j, covariate in enumerate(self.covariate_names):
-                stan_data["covariate{}".format(j+1)][:, country_num] = covariates2[
-                    covariate
-                ]
+            stan_data["covariate1"][:, country_num] = covariates2[self.covariate_names[0]]
+            stan_data["covariate2"][:, country_num] = covariates2[self.covariate_names[1]]
+            stan_data["covariate3"][:, country_num] = covariates2[self.covariate_names[2]]
+            stan_data["covariate4"][:, country_num] = covariates2[self.covariate_names[3]]
+            stan_data["covariate5"][:, country_num] = covariates2[self.covariate_names[3]]
+            stan_data["covariate6"][:, country_num] = covariates2[self.covariate_names[4]]
+
+            
         # convert these arrays to integer dtype
         stan_data["cases"] = stan_data["cases"].astype(int) 
         stan_data["deaths"] = stan_data["deaths"].astype(int)
+
+        #create the any intervention covariate
+        stan_data["covariate4"] = 1*(stan_data["covariate1"]+
+                                     stan_data["covariate2"]+
+                                     stan_data["covariate3"]+
+                                     stan_data["covariate5"]+
+                                     stan_data["covariate6"] >= 1)
+        
         return stan_data

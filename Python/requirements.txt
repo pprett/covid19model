@@ -1,5 +1,7 @@
 PyYAML
-pandas numpy
+pandas
+numpy
 scipy
 statsmodels
 datetime
+pystan
