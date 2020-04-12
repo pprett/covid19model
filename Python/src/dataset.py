@@ -169,7 +169,7 @@ class HierarchicalDataset:
 
             # update Epidemic Start day for each country
             stan_data["EpidemicStart"].append(index_1 + 1 - index_2)
-            stan_data["pop"].append(self.ifr.loc[self.ifr["country"] == country, "popt"])
+            stan_data["pop"].append(self.ifr.loc[self.ifr["country"] == country, "popt"].values[0])
             
             # turn intervention dates into boolean
             for covariate in self.covariate_names:
